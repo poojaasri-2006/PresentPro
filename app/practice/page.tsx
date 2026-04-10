@@ -1,4 +1,5 @@
 "use client";
+export const dynamic = "force-dynamic";
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
@@ -356,9 +357,17 @@ export default function PracticePage() {
         body: JSON.stringify({ feedback: JSON.stringify(result), messages: newHistory }),
       });
       const data = await res.json();
-      if (data.reply) setChatMessages((prev) => [...prev, { role: "model", content: data.reply }]);
+      if (data.reply && data.reply.trim()) {
+        setChatMessages((prev) => [...prev, { role: "model", content: data.reply }]);
+      } else {
+        // Show the actual error if there is one, otherwise generic
+        const errText = data.error
+          ? `Coach error: ${data.error}`
+          : "The coach didn't respond. Please try again in a moment.";
+        setChatMessages((prev) => [...prev, { role: "model", content: `⚠️ ${errText}` }]);
+      }
     } catch {
-      setChatMessages((prev) => [...prev, { role: "model", content: "Sorry, I had trouble connecting. Please try again." }]);
+      setChatMessages((prev) => [...prev, { role: "model", content: "⚠️ Network error — please check your connection and try again." }]);
     } finally {
       setChatLoading(false);
     }
