@@ -126,19 +126,7 @@ export default function Home() {
               Present<span className="gradient-text">Pro</span>
             </span>
           </div>
-          <span
-            style={{
-              padding: "0.3rem 0.9rem",
-              borderRadius: "99px",
-              border: "1px solid var(--border-accent)",
-              background: "rgba(99,102,241,0.1)",
-              fontSize: "0.78rem",
-              color: "#a5b4fc",
-              fontWeight: 600,
-            }}
-          >
-            Powered by Gemini AI
-          </span>
+
           {/* Nav right side — changes based on auth state */}
           {userName ? (
             // Logged-in: show name + dashboard button
