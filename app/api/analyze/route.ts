@@ -1,93 +1,45 @@
-export const maxDuration = 120; // Allow up to 2 min for large video processing
+// Node.js runtime — works reliably on Vercel, Netlify, Railway, Render etc.
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
+/**
+ * POST /api/analyze
+ *
+ * Accepts a small JSON body:
+ *   { fileUri: string; mimeType: string }           ← large-file path (URI from Gemini)
+ *   { inlineBase64: string; mimeType: string }      ← fast-path for tiny files (<1 MB)
+ *
+ * The video itself is NEVER sent through Vercel — it goes directly from the
+ * browser to the Gemini File API.  Only the tiny URI string comes here.
+ */
 
 /** ─── Types ──────────────────────────────────────────────────── */
-interface GeminiFileUploadResponse {
-  file: {
-    name: string;
-    uri: string;
-    mimeType: string;
-    state: string;
-  };
+interface GeminiFileStatusResponse {
+  state?: string;
+  file?: { state?: string };
 }
 
-/** ─── Step 1: Upload video bytes to Gemini File API ─────────── */
-async function uploadToGeminiFileApi(
-  videoBuffer: ArrayBuffer,
-  mimeType: string,
-  fileName: string,
-  apiKey: string
-): Promise<{ uri: string; name: string }> {
-  const numBytes = videoBuffer.byteLength;
-
-  // --- Initiate resumable upload ---
-  const initRes = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: {
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": String(numBytes),
-        "X-Goog-Upload-Header-Content-Type": mimeType,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ file: { display_name: fileName } }),
-    }
-  );
-
-  if (!initRes.ok) {
-    const err = await initRes.text();
-    throw new Error(`File API init failed: ${initRes.status} – ${err}`);
-  }
-
-  const uploadUrl = initRes.headers.get("x-goog-upload-url");
-  if (!uploadUrl) throw new Error("No upload URL returned from Gemini File API");
-
-  // --- Upload the actual bytes ---
-  const uploadRes = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      "Content-Length": String(numBytes),
-      "X-Goog-Upload-Offset": "0",
-      "X-Goog-Upload-Command": "upload, finalize",
-    },
-    body: videoBuffer,
-  });
-
-  if (!uploadRes.ok) {
-    const err = await uploadRes.text();
-    throw new Error(`File upload failed: ${uploadRes.status} – ${err}`);
-  }
-
-  const data: GeminiFileUploadResponse = await uploadRes.json();
-  return { uri: data.file.uri, name: data.file.name };
-}
-
-/** ─── Step 2: Poll until the file state is ACTIVE ───────────── */
+/** ─── Poll until ACTIVE ──────────────────────────────────────── */
 async function waitForFileActive(
   fileName: string,
   apiKey: string,
-  maxWaitMs = 60_000
+  maxWaitMs = 120_000
 ): Promise<void> {
   const deadline = Date.now() + maxWaitMs;
-
   while (Date.now() < deadline) {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`
     );
-    const data = await res.json();
+    const data = (await res.json()) as GeminiFileStatusResponse;
     const state: string = data?.state ?? data?.file?.state ?? "PROCESSING";
-
     if (state === "ACTIVE") return;
     if (state === "FAILED") throw new Error("Gemini file processing failed");
-
-    await new Promise((r) => setTimeout(r, 1500)); // poll every 1.5s (down from 3s)
+    await new Promise((r) => setTimeout(r, 2000));
   }
-
   throw new Error("Timed out waiting for Gemini file to become ACTIVE");
 }
 
-/** ─── Step 3: Delete the file from Gemini (cleanup) ─────────── */
+/** ─── Delete file (cleanup) ──────────────────────────────────── */
 async function deleteGeminiFile(fileName: string, apiKey: string) {
   try {
     await fetch(
@@ -95,115 +47,92 @@ async function deleteGeminiFile(fileName: string, apiKey: string) {
       { method: "DELETE" }
     );
   } catch {
-    // Non-critical – files expire in 48h anyway
+    // Non-critical — files expire in 48 h anyway
   }
 }
 
-// Models tried sequentially — one at a time to avoid quota bursts
-// Confirmed valid via ListModels API — all support generateContent
 const MODELS = [
-  "gemini-2.0-flash",       // fast & reliable, good free quota
-  "gemini-2.0-flash-lite",  // lightest, highest RPM on free tier
-  "gemini-2.5-flash-lite",  // newest lite model, solid fallback
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-2.5-flash-lite",
 ];
 
-/** Detect quota / rate-limit / overload errors from Gemini response */
 function isQuotaError(msg: string): boolean {
-  const lower = msg.toLowerCase();
+  const m = msg.toLowerCase();
   return (
-    lower.includes("resource_exhausted") ||
-    lower.includes("quota") ||
-    lower.includes("rate limit") ||
-    lower.includes("too many requests") ||
-    lower.includes("429") ||
-    lower.includes("high demand")  ||   // "experiencing high demand"
-    lower.includes("overloaded")   ||   // server overload
-    lower.includes("503")          ||   // service unavailable
-    lower.includes("unavailable")  ||   // generic unavailable
-    lower.includes("try again later")   // catch-all retry hint
+    m.includes("resource_exhausted") ||
+    m.includes("quota") ||
+    m.includes("rate limit") ||
+    m.includes("too many requests") ||
+    m.includes("429") ||
+    m.includes("high demand") ||
+    m.includes("overloaded") ||
+    m.includes("503") ||
+    m.includes("unavailable") ||
+    m.includes("try again later")
   );
 }
 
-/** ─── Single model attempt ─────────────────────────────────── */
-async function tryModel(
-  model: string,
-  body: string,
-  apiKey: string
-): Promise<unknown> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    { method: "POST", headers: { "Content-Type": "application/json" }, body }
-  );
-  const data = await res.json();
-  if (!res.ok || data.error) {
-    const errMsg = data?.error?.message ?? `HTTP ${res.status}`;
-    console.error(`[${model}] HTTP ${res.status}:`, JSON.stringify(data?.error ?? data));
-    throw new Error(errMsg);
-  }
-  const raw: string =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((p: { text: string }) => p.text)
-      .join("") ?? "";
-  const cleaned = raw.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
-  console.log(`[${model}] ✓ Raw length: ${cleaned.length} chars`);
-  return parseWithRepair(cleaned);
-}
-
-/**
- * Best-effort JSON repair: closes unterminated strings, arrays, and objects
- * that result from the model hitting its output token limit mid-response.
- */
 function parseWithRepair(raw: string): unknown {
-  // First try clean parse
   try {
     return JSON.parse(raw);
   } catch {
-    // Attempt to repair truncated JSON
     let s = raw;
-
-    // If the string was cut in the middle of a string value, close it
-    // Count unescaped quotes to detect open string
     let inString = false;
-    let i = 0;
-    for (; i < s.length; i++) {
-      if (s[i] === '"' && (i === 0 || s[i - 1] !== '\\')) inString = !inString;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '"' && (i === 0 || s[i - 1] !== "\\")) inString = !inString;
     }
-    if (inString) s += '"'; // close the open string
-
-    // Close any open arrays and objects by counting brackets
+    if (inString) s += '"';
     const stack: string[] = [];
     inString = false;
     for (let j = 0; j < s.length; j++) {
       const ch = s[j];
-      if (ch === '"' && (j === 0 || s[j - 1] !== '\\')) { inString = !inString; continue; }
+      if (ch === '"' && (j === 0 || s[j - 1] !== "\\")) { inString = !inString; continue; }
       if (inString) continue;
-      if (ch === '{') stack.push('}');
-      else if (ch === '[') stack.push(']');
-      else if (ch === '}' || ch === ']') stack.pop();
+      if (ch === "{") stack.push("}");
+      else if (ch === "[") stack.push("]");
+      else if (ch === "}" || ch === "]") stack.pop();
     }
-    // Close in reverse order
     while (stack.length) s += stack.pop();
-
     try {
       const result = JSON.parse(s);
-      console.warn('⚠️ JSON was truncated and repaired — some fields may be incomplete');
+      console.warn("⚠️ JSON was truncated and repaired");
       return result;
-    } catch (repairErr) {
-      throw new Error(`JSON parse failed even after repair: ${repairErr}`);
+    } catch (e) {
+      throw new Error(`JSON parse failed even after repair: ${e}`);
     }
   }
 }
 
-/** ─── Step 4: Sequential model waterfall with backoff ───────── */
+async function tryModel(model: string, body: string, apiKey: string): Promise<unknown> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body }
+  );
+  const data = await res.json() as {
+    error?: { message?: string };
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  if (!res.ok || data.error) {
+    const errMsg = data?.error?.message ?? `HTTP ${res.status}`;
+    throw new Error(errMsg);
+  }
+  const raw =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text ?? "")
+      .join("") ?? "";
+  const cleaned = raw.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+  return parseWithRepair(cleaned);
+}
+
 async function callGemini(
   prompt: string,
   apiKey: string,
   videoData: { mimeType: string; uri?: string; inlineBase64?: string }
-) {
+): Promise<unknown> {
   const parts: { text?: string; file_data?: object; inline_data?: object }[] = [
     { text: prompt },
   ];
-
   if (videoData.uri) {
     parts.unshift({ file_data: { mime_type: videoData.mimeType, file_uri: videoData.uri } });
   } else if (videoData.inlineBase64) {
@@ -212,59 +141,36 @@ async function callGemini(
 
   const body = JSON.stringify({
     contents: [{ parts }],
-    // 8192 tokens prevents response truncation (the cause of "Unterminated string" errors)
     generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
   });
 
-  // Try models sequentially — if one is quota-limited, wait briefly then try the next
-  const delays = [0, 5000, 12000]; // wait before each model attempt (ms)
+  const delays = [0, 5000, 12000];
   let lastError: Error = new Error("No models attempted");
 
   for (let i = 0; i < MODELS.length; i++) {
-    const model = MODELS[i];
-    if (delays[i] > 0) {
-      console.log(`Waiting ${delays[i] / 1000}s before trying ${model}...`);
-      await new Promise((r) => setTimeout(r, delays[i]));
-    }
+    if (delays[i] > 0) await new Promise((r) => setTimeout(r, delays[i]));
     try {
-      console.log(`Trying model: ${model}`);
-      return await tryModel(model, body, apiKey);
+      return await tryModel(MODELS[i], body, apiKey);
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      const errMsg = lastError.message;
-      if (isQuotaError(errMsg)) {
-        console.warn(`[${model}] Quota limit hit, falling back to next model...`);
-        // continue to next model
-      } else if (errMsg.includes("JSON") || errMsg.includes("parse") || errMsg.includes("Unexpected")) {
-        // Truncated/malformed JSON from this model — try next model which may give a complete response
-        console.warn(`[${model}] JSON parse error, trying next model: ${errMsg}`);
-        // continue to next model
-      } else {
-        // Unexpected error — throw immediately
-        throw lastError;
-      }
+      if (isQuotaError(lastError.message)) continue;
+      if (lastError.message.includes("JSON") || lastError.message.includes("parse")) continue;
+      throw lastError;
     }
   }
 
-  // All models exhausted — final retry after a longer cooldown
-  console.warn("All models quota-limited, waiting 20s for a final retry...");
   await new Promise((r) => setTimeout(r, 20000));
   try {
     return await tryModel(MODELS[0], body, apiKey);
   } catch {
-    throw new Error(
-      "API quota limit reached. Please wait 1–2 minutes and try again, or use a shorter video."
-    );
+    throw new Error("API quota limit reached. Please wait 1–2 minutes and try again.");
   }
 }
 
-/** ─── Step 5: Single combined analysis (saves quota vs. 2 parallel calls) ─ */
 async function analyzeVideo(
   apiKey: string,
   videoData: { mimeType: string; uri?: string; inlineBase64?: string }
-) {
-  // ONE prompt = ONE race of 3 models instead of TWO races (6 requests).
-  // This is the key change that stops quota exhaustion.
+): Promise<unknown> {
   const prompt = `You are an expert presentation coach. Analyze this video carefully.
 Return ONLY valid JSON (no markdown) matching this exact schema:
 {
@@ -281,10 +187,10 @@ Return ONLY valid JSON (no markdown) matching this exact schema:
 }
 Rules: detect ALL filler words (um, uh, like, you know, so, basically, right, etc), flag grammar errors and repeated content words, score based on clarity, professionalism and body language.`;
 
-  return await callGemini(prompt, apiKey, videoData);
+  return callGemini(prompt, apiKey, videoData);
 }
 
-/** ─── POST Handler ───────────────────────────────────────────── */
+/** ─── POST handler ───────────────────────────────────────────── */
 export async function POST(req: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -294,70 +200,54 @@ export async function POST(req: Request) {
   let fileName: string | null = null;
 
   try {
-    // Accept multipart form data with the video file
-    const formData = await req.formData();
-    const videoFile = formData.get("video") as File | null;
+    const body = await req.json() as {
+      fileUri?: string;
+      fileName?: string;
+      mimeType?: string;
+      inlineBase64?: string;
+    };
 
-    if (!videoFile) {
+    const mimeType = body.mimeType ?? "video/mp4";
+
+    let result: unknown;
+
+    if (body.inlineBase64) {
+      // ── Fast-path: tiny video sent inline ──
+      result = await analyzeVideo(apiKey, { mimeType, inlineBase64: body.inlineBase64 });
+
+    } else if (body.fileUri && body.fileName) {
+      // ── Standard-path: video already uploaded to Gemini File API ──
+      fileName = body.fileName; // e.g. "files/abc123"
+
+      // Wait for Gemini to finish processing the upload
+      await waitForFileActive(fileName, apiKey);
+
+      // Run the analysis
+      result = await analyzeVideo(apiKey, { mimeType, uri: body.fileUri });
+
+      // Clean up
+      await deleteGeminiFile(fileName, apiKey);
+      fileName = null;
+
+    } else {
       return Response.json(
-        {
-          error: "No video file provided",
-          summary: "Please upload a video file to analyze.",
-        },
+        { error: "Provide either fileUri+fileName or inlineBase64 in the request body." },
         { status: 400 }
       );
     }
 
-    const mimeType = videoFile.type || "video/mp4";
-    const videoBuffer = await videoFile.arrayBuffer();
-    const videoSize = videoBuffer.byteLength;
-
-    let result;
-
-    // FAST-PATH: If video is < 20MB send inline — no File API wait required
-    if (videoSize < 20 * 1024 * 1024) {
-      console.log(`Fast-path (inline): ${videoFile.name} (${(videoSize / 1024 / 1024).toFixed(1)}MB)`);
-      const base64Data = Buffer.from(videoBuffer).toString("base64");
-      result = await analyzeVideo(apiKey, { mimeType, inlineBase64: base64Data });
-    } else {
-      console.log(`Standard-path (File API): ${videoFile.name} (${(videoSize / 1024 / 1024).toFixed(1)}MB)`);
-      // 1. Upload to Gemini File API
-      const { uri, name } = await uploadToGeminiFileApi(
-        videoBuffer,
-        mimeType,
-        videoFile.name,
-        apiKey
-      );
-      fileName = name;
-
-      // 2. Wait for processing (standard path)
-      await waitForFileActive(fileName, apiKey);
-
-      // 3. Analyze with single prompt
-      result = await analyzeVideo(apiKey, { mimeType, uri });
-    }
-
-    // 4. Cleanup (if using File API)
-    if (fileName) {
-      await deleteGeminiFile(fileName, apiKey);
-    }
-
     return Response.json(result);
-  } catch (error) {
-    console.error("PresentPro analyze error:", error);
 
-    // Attempt cleanup even on error
-    if (fileName) {
-      await deleteGeminiFile(fileName, process.env.GEMINI_API_KEY ?? "");
-    }
+  } catch (error) {
+    if (fileName) await deleteGeminiFile(fileName, process.env.GEMINI_API_KEY ?? "");
 
     const message = error instanceof Error ? error.message : "Unknown error";
-    const isQuotaError = message.includes("quota exceeded") || message.includes("RESOURCE_EXHAUSTED");
+    const isQuota = message.includes("quota") || message.includes("RESOURCE_EXHAUSTED");
     return Response.json(
       {
         error: message,
-        summary: isQuotaError
-          ? "⚠️ API quota limit reached. Please wait a few minutes before trying again, or upgrade your Google AI plan."
+        summary: isQuota
+          ? "⚠️ API quota limit reached. Please wait a few minutes and try again."
           : "Analysis failed. Please try again with a smaller or clearer video.",
         fillerWords: [],
         repeatedWords: [],
@@ -365,17 +255,13 @@ export async function POST(req: Request) {
         sentenceImprovements: [],
         facialExpressions: [],
         bodyLanguage: [],
-        suggestions: isQuotaError
-          ? [
-              "Wait 1–2 minutes and retry — free tier limits reset per minute",
-              "Check your quota at https://ai.dev/rate-limit",
-              "Consider upgrading to a paid Google AI plan for higher limits",
-            ]
+        suggestions: isQuota
+          ? ["Wait 1–2 minutes and retry", "Try a shorter clip"]
           : ["Try a shorter clip (under 5 minutes)", "Ensure good audio quality"],
         overallScore: 0,
         transcript: "",
       },
-      { status: isQuotaError ? 429 : 500 }
+      { status: isQuota ? 429 : 500 }
     );
   }
 }

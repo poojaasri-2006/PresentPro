@@ -1,0 +1,26 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# Increase function timeout — Netlify free tier max is 10s, Pro is 26s
+# For long AI analysis, we rely on the browser staying connected
+[functions]
+  node_bundler = "esbuild"
+
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    # Allow the browser to make cross-origin requests TO Gemini File API
+    Access-Control-Allow-Origin = "*"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    # Loosen CSP so the browser XHR to googleapis.com is not blocked
+    Content-Security-Policy = "default-src 'self'; connect-src 'self' https://*.googleapis.com https://generativelanguage.googleapis.com https://*.supabase.co; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https://*.supabase.co; media-src 'self' blob: https://*.supabase.co; worker-src blob:;"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
