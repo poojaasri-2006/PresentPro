@@ -443,65 +443,53 @@ export default function PracticePage() {
     await runAnalysis(file);
   };
 
-  /* ── Core upload + analyze (fetch-based, captures Gemini file info) ── */
+  /* ── Core upload + analyze ── */
   const runAnalysis = async (videoFile: File) => {
     const mimeType = videoFile.type || "video/mp4";
 
     try {
-      // STEP 1: Get Gemini resumable upload URL from server
-      setAnalysisStep(0);
-      const initRes = await fetch("/api/upload-init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileName: videoFile.name,
-          mimeType,
-          fileSize: videoFile.size,
-        }),
-      });
-
-      if (!initRes.ok) {
-        const errData = await initRes.json() as { error?: string };
-        throw new Error(errData.error ?? `Upload init failed (${initRes.status})`);
-      }
-      const { uploadUrl } = await initRes.json() as { uploadUrl: string };
-
-      // STEP 2: Upload video DIRECTLY from browser to Gemini (bypasses Vercel)
+      // STEP 1 & 2: Upload video through our server proxy
+      // (Direct browser→Gemini XHR is blocked by CORS — server proxy fixes this)
       setAnalysisStep(1);
-      setUploadProgress(0);
+      setUploadProgress(5);
 
-      // Use XHR for upload progress tracking
-      const uploadResponseText = await new Promise<string>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", uploadUrl);
-        xhr.setRequestHeader("Content-Length", String(videoFile.size));
-        xhr.setRequestHeader("X-Goog-Upload-Offset", "0");
-        xhr.setRequestHeader("X-Goog-Upload-Command", "upload, finalize");
+      const formData = new FormData();
+      formData.append("video", videoFile);
 
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) setUploadProgress(Math.round((e.loaded / e.total) * 100));
-        };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText);
-          else reject(new Error(`Gemini upload failed: ${xhr.status} — ${xhr.responseText.slice(0, 200)}`));
-        };
-        xhr.onerror = () => reject(new Error("Upload failed. Please check your internet connection."));
-        xhr.send(videoFile);
-      });
+      // Animate progress while upload runs in background
+      let prog = 5;
+      const ticker = setInterval(() => {
+        prog = Math.min(prog + 2, 88);
+        setUploadProgress(prog);
+      }, 500);
 
+      let proxyRes: Response;
+      try {
+        proxyRes = await fetch("/api/upload-proxy", {
+          method: "POST",
+          body: formData,
+        });
+      } finally {
+        clearInterval(ticker);
+      }
       setUploadProgress(100);
 
-      // Parse Gemini file info from upload response
-      interface GeminiUploadResponse { file?: { name?: string; uri?: string } }
-      const uploadData = JSON.parse(uploadResponseText) as GeminiUploadResponse;
-      const geminiFileName = uploadData?.file?.name ?? ""; // e.g. "files/abc123"
-      const geminiFileUri = uploadData?.file?.uri ?? "";   // e.g. "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+      const proxyText = await proxyRes.text();
+      if (!proxyRes.ok) {
+        let msg = proxyText;
+        try { msg = (JSON.parse(proxyText) as { error?: string })?.error ?? proxyText; } catch { /* keep raw */ }
+        throw new Error(`Upload failed (${proxyRes.status}): ${msg}`);
+      }
+
+      const proxyData = JSON.parse(proxyText) as { fileUri: string; fileName: string; mimeType: string };
+      const geminiFileName = proxyData.fileName ?? "";
+      const geminiFileUri  = proxyData.fileUri  ?? "";
 
       if (!geminiFileName || !geminiFileUri) {
         throw new Error("Could not get file info from Gemini. Please try again.");
       }
 
-      // STEP 3: Ask our server to analyze using just the file URI (tiny payload)
+      // STEP 3: Ask our server to analyze using just the file URI
       setAnalysisStep(2);
       const analyzeRes = await fetch("/api/analyze", {
         method: "POST",
@@ -509,15 +497,13 @@ export default function PracticePage() {
         body: JSON.stringify({ fileUri: geminiFileUri, fileName: geminiFileName, mimeType }),
       });
 
-      // Read as text first so we can show real error if server returns non-JSON
+      // Read as text first so real errors are visible
       const rawText = await analyzeRes.text();
       let data: AnalysisResult;
       try {
         data = JSON.parse(rawText) as AnalysisResult;
       } catch {
-        // Server returned something that isn't JSON — show raw message
-        const preview = rawText.slice(0, 300);
-        throw new Error(`Server returned an unexpected response: ${preview}`);
+        throw new Error(`Server error: ${rawText.slice(0, 300)}`);
       }
 
       if (data.error && data.overallScore === 0) {
