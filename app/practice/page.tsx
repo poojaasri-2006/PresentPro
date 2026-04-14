@@ -150,10 +150,10 @@ function TranscriptPanel({ text }: { text: string }) {
 }
 
 /* ─── Progress Stepper ───────────────────────────────────────────── */
-const STEPS = ["Uploading", "Processing", "Analyzing"];
+const STEPS = ["Preparing", "Uploading", "Analyzing"];
 
-function ProgressStepper({ step }: { step: number }) {
-  // step: 0 = uploading, 1 = processing, 2 = analyzing, 3 = done
+function ProgressStepper({ step, uploadProgress }: { step: number; uploadProgress: number }) {
+  // step: 0 = getting upload URL, 1 = uploading to Gemini, 2 = analyzing, done = -1
   return (
     <div style={{ padding: "2rem 0" }}>
       <div
@@ -203,8 +203,29 @@ function ProgressStepper({ step }: { step: number }) {
         ))}
       </div>
 
+      {/* Upload progress bar (shown during step 1) */}
+      {step === 1 && uploadProgress > 0 && (
+        <div style={{ maxWidth: "360px", margin: "1.5rem auto 0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "0.4rem" }}>
+            <span style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>Uploading to Gemini…</span>
+            <span style={{ fontSize: "0.8rem", color: "#a5b4fc", fontWeight: 700 }}>{uploadProgress}%</span>
+          </div>
+          <div style={{ height: "6px", background: "rgba(99,102,241,0.15)", borderRadius: "99px", overflow: "hidden" }}>
+            <div
+              style={{
+                height: "100%",
+                width: `${uploadProgress}%`,
+                background: "linear-gradient(90deg, var(--accent-primary), var(--accent-secondary))",
+                borderRadius: "99px",
+                transition: "width 0.3s ease",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {/* Spinner */}
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginTop: "2rem", gap: "0.75rem" }}>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginTop: "1.75rem", gap: "0.75rem" }}>
         <div
           style={{
             width: "42px",
@@ -216,12 +237,14 @@ function ProgressStepper({ step }: { step: number }) {
           }}
         />
         <p style={{ color: "var(--text-secondary)", fontSize: "0.92rem" }}>
-          {step === 0 ? "Uploading your video to Gemini…" :
-           step === 1 ? "Gemini is processing your video…" :
+          {step === 0 ? "Getting a secure upload URL…" :
+           step === 1 ? "Uploading your video directly to Gemini…" :
            "AI is analyzing your presentation…"}
         </p>
         <p style={{ color: "var(--text-muted)", fontSize: "0.8rem" }}>
-          This may take 30–60 seconds for longer videos
+          {step === 1
+            ? "The video uploads directly — Vercel never touches it"
+            : "This may take 30–90 seconds for longer videos"}
         </p>
       </div>
     </div>
@@ -242,6 +265,7 @@ export default function PracticePage() {
   const [error, setError] = useState<string | null>(null);
   const [savedToDb, setSavedToDb] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0); // 0-100 during video upload
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Recording state
@@ -410,65 +434,128 @@ export default function PracticePage() {
   /* ── Analyze ── */
   const handleAnalyze = async () => {
     if (!file) { setError("Please upload a video first."); return; }
-
+    if (file.size > 100 * 1024 * 1024) {
+      setError("Video is too large (max 100 MB). Please trim or compress it.");
+      return;
+    }
     setError(null);
     setResult(null);
-    setAnalysisStep(0);
+    await runAnalysis(file);
+  };
+
+  /* ── Core upload + analyze (fetch-based, captures Gemini file info) ── */
+  const runAnalysis = async (videoFile: File) => {
+    const mimeType = videoFile.type || "video/mp4";
 
     try {
-      const formData = new FormData();
-      formData.append("video", file);
-
-      setAnalysisStep(1);
-
-      const res = await fetch("/api/analyze", {
+      // STEP 1: Get Gemini resumable upload URL from server
+      setAnalysisStep(0);
+      const initRes = await fetch("/api/upload-init", {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: videoFile.name,
+          mimeType,
+          fileSize: videoFile.size,
+        }),
       });
 
-      setAnalysisStep(2);
+      if (!initRes.ok) {
+        const errData = await initRes.json() as { error?: string };
+        throw new Error(errData.error ?? `Upload init failed (${initRes.status})`);
+      }
+      const { uploadUrl } = await initRes.json() as { uploadUrl: string };
 
-      const data: AnalysisResult = await res.json();
+      // STEP 2: Upload video DIRECTLY from browser to Gemini (bypasses Vercel)
+      setAnalysisStep(1);
+      setUploadProgress(0);
+
+      // Use XHR for upload progress tracking
+      const uploadResponseText = await new Promise<string>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", uploadUrl);
+        xhr.setRequestHeader("Content-Length", String(videoFile.size));
+        xhr.setRequestHeader("X-Goog-Upload-Offset", "0");
+        xhr.setRequestHeader("X-Goog-Upload-Command", "upload, finalize");
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) setUploadProgress(Math.round((e.loaded / e.total) * 100));
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText);
+          else reject(new Error(`Gemini upload failed: ${xhr.status} — ${xhr.responseText.slice(0, 200)}`));
+        };
+        xhr.onerror = () => reject(new Error("Upload failed. Please check your internet connection."));
+        xhr.send(videoFile);
+      });
+
+      setUploadProgress(100);
+
+      // Parse Gemini file info from upload response
+      interface GeminiUploadResponse { file?: { name?: string; uri?: string } }
+      const uploadData = JSON.parse(uploadResponseText) as GeminiUploadResponse;
+      const geminiFileName = uploadData?.file?.name ?? ""; // e.g. "files/abc123"
+      const geminiFileUri = uploadData?.file?.uri ?? "";   // e.g. "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+
+      if (!geminiFileName || !geminiFileUri) {
+        throw new Error("Could not get file info from Gemini. Please try again.");
+      }
+
+      // STEP 3: Ask our server to analyze using just the file URI (tiny payload)
+      setAnalysisStep(2);
+      const analyzeRes = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileUri: geminiFileUri, fileName: geminiFileName, mimeType }),
+      });
+
+      // Read as text first so we can show real error if server returns non-JSON
+      const rawText = await analyzeRes.text();
+      let data: AnalysisResult;
+      try {
+        data = JSON.parse(rawText) as AnalysisResult;
+      } catch {
+        // Server returned something that isn't JSON — show raw message
+        const preview = rawText.slice(0, 300);
+        throw new Error(`Server returned an unexpected response: ${preview}`);
+      }
 
       if (data.error && data.overallScore === 0) {
         setError(data.error);
         setAnalysisStep(-1);
+        setUploadProgress(0);
         return;
       }
 
       setResult(data);
       setAnalysisStep(-1);
+      setUploadProgress(0);
 
-      // ── Save to Supabase ──────────────────────────────────────
+      // ── Save to Supabase ────────────────────────────────────────
       try {
         const { data: { user } } = await supabase.auth.getUser();
-        if (user && file) {
-          // 1. Upload video to Supabase Storage
-          let videoPublicUrl: string = file.name; // fallback to filename if upload fails
-          const ext = file.name.split(".").pop() ?? "mp4";
-          const storagePath = `${user.id}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+        if (user) {
+          let videoPublicUrl: string = videoFile.name;
+          const ext = videoFile.name.split(".").pop() ?? "mp4";
+          const storagePath = `${user.id}/${Date.now()}_${videoFile.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 
           const { error: storageErr } = await supabase.storage
             .from("presentation-videos")
-            .upload(storagePath, file, {
+            .upload(storagePath, videoFile, {
               cacheControl: "3600",
               upsert: false,
-              contentType: file.type || `video/${ext}`,
+              contentType: videoFile.type || `video/${ext}`,
             });
 
           if (storageErr) {
-            console.warn("Storage upload failed (saving feedback only):", storageErr.message);
-            setSaveError(`Video could not be stored (${storageErr.message}), but feedback is saved.`);
+            setSaveError(`Video stored via Gemini, but Supabase backup failed: ${storageErr.message}`);
           } else {
-            // 2. Get the public URL
             const { data: urlData } = supabase.storage
               .from("presentation-videos")
               .getPublicUrl(storagePath);
             videoPublicUrl = urlData.publicUrl;
-            console.log("Video uploaded to Storage:", videoPublicUrl);
           }
 
-          // 3. Save feedback + video URL to user_videos
           const { error: dbErr } = await supabase.from("user_videos").insert({
             user_id: user.id,
             video_url: videoPublicUrl,
@@ -476,10 +563,8 @@ export default function PracticePage() {
           });
 
           if (dbErr) {
-            console.error("Supabase DB Save Error:", dbErr);
             setSaveError(`Analysis shown, but dashboard save failed: ${dbErr.message}`);
           } else {
-            console.log("Session saved to dashboard ✓");
             setSavedToDb(true);
             setTimeout(() => setSavedToDb(false), 5000);
           }
@@ -488,9 +573,16 @@ export default function PracticePage() {
         console.error("Save error:", saveEx);
         setSaveError("Could not save session to dashboard.");
       }
-    } catch {
-      setError("Network error. Please check your connection and try again.");
+
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(
+        msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED")
+          ? "⚠️ Gemini API quota reached. Please wait 1–2 minutes and try again."
+          : msg.startsWith("Error:") ? msg : `Error: ${msg}`
+      );
       setAnalysisStep(-1);
+      setUploadProgress(0);
     }
   };
 
@@ -799,7 +891,7 @@ export default function PracticePage() {
         {/* ── Loading / progress ── */}
         {isLoading && (
           <div className="glass-card animate-fade-in" style={{ padding: "1.5rem" }}>
-            <ProgressStepper step={analysisStep} />
+            <ProgressStepper step={analysisStep} uploadProgress={uploadProgress} />
           </div>
         )}
 

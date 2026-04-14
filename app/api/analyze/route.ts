@@ -121,9 +121,24 @@ async function tryModel(model: string, body: string, apiKey: string): Promise<un
     data?.candidates?.[0]?.content?.parts
       ?.map((p) => p.text ?? "")
       .join("") ?? "";
-  const cleaned = raw.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  // Strip markdown code fences
+  let cleaned = raw.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+
+  // If Gemini wrapped the JSON in extra text, extract just the JSON object
+  if (!cleaned.startsWith("{")) {
+    const jsonStart = cleaned.indexOf("{");
+    const jsonEnd = cleaned.lastIndexOf("}");
+    if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+      cleaned = cleaned.slice(jsonStart, jsonEnd + 1);
+    } else {
+      throw new Error(`Gemini returned non-JSON response: ${cleaned.slice(0, 100)}`);
+    }
+  }
+
   return parseWithRepair(cleaned);
 }
+
 
 async function callGemini(
   prompt: string,
